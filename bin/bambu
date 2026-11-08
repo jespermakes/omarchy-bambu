@@ -1,0 +1,1241 @@
+#!/usr/bin/env python3
+"""bambu: your Bambu Lab printer from the terminal and the Omarchy bar.
+
+Talks straight to the printer on your own network (MQTT on 8883, camera on
+322 or 6000). No cloud, no account, no extra packages: Python's standard
+library only, plus ffmpeg for the H2D/X1 camera.
+
+  bambu setup                  add a printer (or set one up again), step by step
+  bambu list                   the printers you have set up
+  bambu status [--json]        what they are doing now
+  bambu watch [--json]         follow them live (Ctrl-C to quit)
+  bambu pause | resume         pause or resume the print
+  bambu stop [--yes]           cancel the print (asks first)
+  bambu light on|off           chamber light
+  bambu speed silent|standard|sport|ludicrous
+  bambu snapshot [FILE]        one camera picture (default: a temp file)
+  bambu doctor                 check every part of the connection
+  bambu rename PRINTER NAME    give a printer a new name
+  bambu forget PRINTER         remove a printer
+
+With more than one printer, name it: `bambu pause h2d`, or `-p h2d` anywhere.
+Status, watch and doctor cover all printers when you name none.
+
+Controls (pause, stop, light, speed) need Developer Mode on the printer.
+Everything else works without it.
+"""
+
+import json
+import os
+import shutil
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "0.2.0"
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "bambu-printer")
+CONFIG = os.path.join(CONFIG_DIR, "printers.json")
+OLD_CONFIG = os.path.join(CONFIG_DIR, "printer.json")  # v0.1, one printer; migrated on first read
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+
+# SSDP model codes we have seen or that the community documents. Unknown codes
+# still work: the model name is also read from the printer itself.
+MODELS = {
+    "O1D": "H2D", "O1S": "H2S", "O1C": "H2C",
+    "BL-P001": "X1 Carbon", "BL-P002": "X1", "C13": "X1E",
+    "C11": "P1P", "C12": "P1S", "N7": "P2S",
+    "N1": "A1 mini", "N2S": "A1",
+}
+STATES = {
+    "RUNNING": "Printing", "PREPARE": "Starting", "PAUSE": "Paused", "FAILED": "Failed",
+    "FINISH": "Done", "IDLE": "Idle", "SLICING": "Slicing", "INIT": "Starting up",
+}
+SPEEDS = {"silent": 1, "standard": 2, "sport": 3, "ludicrous": 4}
+SPEED_NAMES = {v: k for k, v in SPEEDS.items()}
+
+
+class Fail(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- config
+
+OWN_WRITE = None  # mtime of the last config write made by `watch` itself
+WANT = None  # the printer named with -p/--printer or as a word on the command line
+
+
+def slug(name, taken):
+    import re
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "printer"
+    s, n = base, 2
+    while s in taken:
+        s, n = f"{base}-{n}", n + 1
+    return s
+
+
+def load_all():
+    if not os.path.exists(CONFIG) and os.path.exists(OLD_CONFIG):
+        with open(OLD_CONFIG) as f:
+            old = json.load(f)
+        old.setdefault("id", slug(old.get("name") or "printer", []))
+        save_all([old])
+        os.unlink(OLD_CONFIG)
+    try:
+        with open(CONFIG) as f:
+            return json.load(f).get("printers", [])
+    except FileNotFoundError:
+        return []
+
+
+def save_all(printers):
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+    tmp = CONFIG + ".part"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)  # a leftover .part file would otherwise keep its old mode
+    with os.fdopen(fd, "w") as f:
+        json.dump({"version": 2, "printers": printers}, f, indent=2)
+    os.replace(tmp, CONFIG)
+
+
+def pick(printers, want):
+    if not printers:
+        raise Fail("No printer set up yet. Run: bambu setup")
+    names = ", ".join(p["id"] for p in printers)
+    if want is None:
+        if len(printers) == 1:
+            return printers[0]
+        raise Fail(f"You have {len(printers)} printers ({names}). Say which one, for example: bambu pause {printers[0]['id']}")
+    w = want.lower()
+    for p in printers:
+        if w in (p["id"], str(p.get("name", "")).lower(), str(p.get("serial", "")).lower()):
+            return p
+    hits = [p for p in printers if p["id"].startswith(w) or str(p.get("name", "")).lower().startswith(w)]
+    if len(hits) == 1:
+        return hits[0]
+    raise Fail(f"No printer called '{want}'. Yours: {names}")
+
+
+ARG_WORDS = {"on", "off", "--yes", "--json"} | set(SPEEDS)
+
+
+def is_printer(word):
+    """A bare word names a printer only on an exact id or name (prefixes need -p),
+    so a printer called "office" cannot swallow `bambu light off`."""
+    if not word or word.startswith("-") or word.lower() in ARG_WORDS:
+        return False
+    w = word.lower()
+    return any(w in (p["id"], str(p.get("name", "")).lower()) for p in load_all())
+
+
+def load_config(required=True):
+    try:
+        return pick(load_all(), WANT)
+    except Fail:
+        if required:
+            raise
+        return None
+
+
+def save_config(cfg):
+    """Store one printer, matched by serial number; add it when it is new."""
+    printers = load_all()
+    for i, p in enumerate(printers):
+        if p.get("serial") == cfg.get("serial"):
+            printers[i] = cfg
+            break
+    else:
+        printers.append(cfg)
+    save_all(printers)
+
+
+# ---------------------------------------------------------------- discovery
+
+def discover(seconds=6.0, passes=2):
+    """Find printers two ways at once and merge them by serial number:
+    - listen for the SSDP announcements they multicast every few seconds, and
+    - scan this laptop's own /24 for port 8883 and read the printer's TLS certificate,
+      whose name is the serial. Omarchy's firewall drops incoming traffic by default,
+      which silently kills the announcements; the scan is outgoing, so it still works."""
+    import threading
+    heard, scanned = [], []
+    t = threading.Thread(target=lambda: heard.extend(listen_ssdp(seconds)), daemon=True)
+    t.start()
+    scanned.extend(scan_subnet(passes))
+    t.join(seconds + 1)
+    found = {p["serial"]: p for p in scanned}
+    for p in heard:  # announcements carry the friendly name and model, so they win
+        found[p["serial"]] = dict(found.get(p["serial"], {}), **p)
+    return sorted(found.values(), key=lambda p: p["ip"])
+
+
+def local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9))  # no packet is sent; this just picks the outgoing interface
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def cert_names(der):
+    """Every commonName in a DER certificate, issuer first, subject last."""
+    names, i = [], 0
+    while True:
+        i = der.find(b"\x55\x04\x03", i)
+        if i < 0 or i + 5 > len(der):
+            return names
+        n = der[i + 4]
+        names.append(der[i + 5:i + 5 + n].decode(errors="replace"))
+        i += 5 + n
+
+
+def probe(ip, timeout=2.5):
+    # 2.5 s, not less: a cold neighbour lookup on Wi-Fi takes a second or more, and a
+    # 0.8 s timeout missed a printer that answers in 0.7 s once the laptop knows it.
+    try:
+        raw = socket.create_connection((ip, 8883), timeout=timeout)
+    except OSError:
+        return None
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        raw.settimeout(3)
+        with ctx.wrap_socket(raw, server_hostname=ip) as s:
+            der = s.getpeercert(binary_form=True) or b""
+    except (OSError, ssl.SSLError):
+        return None
+    names = cert_names(der)
+    if b"BBL" not in der or not names:
+        return None
+    return {"serial": names[-1], "ip": ip, "name": "Bambu printer", "model_code": "", "model": "", "mode": ""}
+
+
+def scan_subnet(passes=2):
+    from concurrent.futures import ThreadPoolExecutor
+    me = local_ip()
+    if not me:
+        return []
+    base = me.rsplit(".", 1)[0]
+    ips = [f"{base}.{n}" for n in range(1, 255) if f"{base}.{n}" != me]
+    for attempt in range(passes):  # the second pass runs with the neighbour table warm
+        with ThreadPoolExecutor(max_workers=128) as pool:
+            hits = [p for p in pool.map(probe, ips) if p]
+        if hits:
+            return hits
+    return []
+
+
+def listen_ssdp(seconds):
+    """Listen for the announcements Bambu printers multicast every few seconds."""
+    found = {}
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("", 2021))
+    except OSError:
+        return []  # port taken (Bambu Studio running?); the scan still finds it
+    try:
+        mreq = struct.pack("4sl", socket.inet_aton("239.255.255.250"), socket.INADDR_ANY)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    except OSError:
+        pass  # broadcast still arrives on most networks
+    end = time.time() + seconds
+    while time.time() < end:
+        s.settimeout(max(0.1, end - time.time()))
+        try:
+            data, addr = s.recvfrom(4096)
+        except socket.timeout:
+            break
+        head = {}
+        for line in data.decode(errors="replace").splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                head[k.strip().lower()] = v.strip()
+        if "bambulab" not in head.get("nt", "") and "devmodel.bambu.com" not in head:
+            continue
+        serial = head.get("usn", "")
+        if not serial or serial in found:
+            continue
+        code = head.get("devmodel.bambu.com", "")
+        found[serial] = {
+            "serial": serial,
+            "ip": head.get("location", addr[0]),
+            "name": head.get("devname.bambu.com", "Bambu printer"),
+            "model_code": code,
+            "model": MODELS.get(code, code or "unknown model"),
+            "mode": head.get("devconnect.bambu.com", ""),  # "lan" = LAN-only mode on
+        }
+    s.close()
+    return list(found.values())
+
+
+def name_from(raw, cfg):
+    """A friendly name when discovery only had the scan: 'H2D', from the printer itself."""
+    for mod in (raw.get("info") or {}).get("module", []) or []:
+        if mod.get("name") == "ota" and mod.get("product_name"):
+            return mod["product_name"].replace("Bambu Lab ", "")
+    return cfg.get("model") or "Bambu printer"
+
+
+# ---------------------------------------------------------------- MQTT (3.1.1, just enough)
+
+def _varint(n):
+    out = bytearray()
+    while True:
+        b = n % 128
+        n //= 128
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _str(s):
+    b = s.encode()
+    return struct.pack("!H", len(b)) + b
+
+
+def tls_socket(ip, port, timeout=6.0):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE  # the printer's certificate is self-signed
+    raw = socket.create_connection((ip, port), timeout=timeout)
+    return ctx.wrap_socket(raw, server_hostname=ip)
+
+
+class Mqtt:
+    def __init__(self, cfg, timeout=6.0):
+        self.cfg = cfg
+        self.serial = cfg["serial"]
+        self.buf = b""
+        self.seq = int(time.time()) % 100000
+        try:
+            self.sock = tls_socket(cfg["ip"], 8883, timeout)
+        except (OSError, ssl.SSLError) as e:
+            raise Fail(f"Could not reach the printer at {cfg['ip']} ({e.__class__.__name__}: {e}).")
+        self.sock.settimeout(timeout)
+        self.last_rx = time.time()
+        client_id = "omarchy-bambu-%d" % os.getpid()
+        var = _str("MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 60)
+        payload = _str(client_id) + _str("bblp") + _str(cfg["code"])
+        body = var + payload
+        self.sock.sendall(bytes([0x10]) + _varint(len(body)) + body)
+        ptype, data = self._packet()
+        if ptype != 2:
+            raise Fail("The printer answered, but not like an MQTT broker.")
+        rc = data[1] if len(data) > 1 else 255
+        if rc in (4, 5):
+            raise Fail("The printer refused the access code. Check it on the printer screen.")
+        if rc != 0:
+            raise Fail(f"The printer refused the connection (code {rc}).")
+        self._send(0x82, struct.pack("!H", 1) + _str(f"device/{self.serial}/report") + b"\x00")
+        self.last_ping = time.time()
+
+    def _send(self, first, body):
+        self.sock.sendall(bytes([first]) + _varint(len(body)) + body)
+
+    def _fill(self):
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise Fail("The printer closed the connection.")
+        self.buf += chunk
+        self.last_rx = time.time()
+
+    def _parse(self):
+        """One whole packet from the buffer, or None. Nothing is consumed until the packet is
+        complete, so a timeout halfway through a big report cannot throw the stream off."""
+        b = self.buf
+        mult, length, i = 1, 0, 1
+        while True:
+            if i >= len(b):
+                return None
+            c = b[i]
+            length += (c & 0x7F) * mult
+            mult *= 128
+            i += 1
+            if not c & 0x80:
+                break
+            if i > 4:
+                raise Fail("The printer sent a garbled message.")
+        if len(b) < i + length:
+            return None
+        self.buf = b[i + length:]
+        return b[0] >> 4, b[i:i + length]
+
+    def _packet(self):
+        while True:
+            p = self._parse()
+            if p:
+                return p
+            self._fill()
+
+    def publish(self, msg):
+        self.seq += 1
+        for section in msg.values():
+            if isinstance(section, dict):
+                section.setdefault("sequence_id", str(self.seq))
+        body = _str(f"device/{self.serial}/request") + json.dumps(msg).encode()
+        self._send(0x30, body)
+        return str(self.seq)
+
+    def messages(self, seconds):
+        """Yield decoded report messages for up to `seconds` (None = forever)."""
+        end = None if seconds is None else time.time() + seconds
+        while end is None or time.time() < end:
+            if time.time() - self.last_ping > 30:
+                self._send(0xC0, b"")
+                self.last_ping = time.time()
+            wait = 15.0 if end is None else max(0.05, min(15.0, end - time.time()))
+            self.sock.settimeout(wait)
+            try:
+                ptype, data = self._packet()
+            except (socket.timeout, TimeoutError):
+                # We ping every 30 s and the printer answers, so 90 s of silence means it is gone
+                # (off, or dropped off the Wi-Fi) even if the TCP connection still looks open.
+                if time.time() - self.last_rx > 90:
+                    raise Fail("The printer stopped answering.")
+                continue
+            if ptype != 3:
+                continue
+            tlen = struct.unpack("!H", data[:2])[0]
+            payload = data[2 + tlen:]
+            try:
+                yield json.loads(payload)
+            except ValueError:
+                continue
+
+    def close(self):
+        try:
+            self._send(0xE0, b"")
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def merge(into, new):
+    for k, v in new.items():
+        if isinstance(v, dict) and isinstance(into.get(k), dict):
+            merge(into[k], v)
+        else:
+            into[k] = v
+    return into
+
+
+def fetch_raw(cfg, seconds=8.0):
+    m = Mqtt(cfg)
+    try:
+        m.publish({"pushing": {"command": "pushall", "version": 1, "push_target": 1}})
+        m.publish({"info": {"command": "get_version"}})
+        got = {}
+        for msg in m.messages(seconds):
+            merge(got, msg)
+            p = got.get("print", {})
+            if "gcode_state" in p and len(p) > 30 and "info" in got:
+                break
+        return got
+    finally:
+        m.close()
+
+
+# ---------------------------------------------------------------- reading the report
+
+def _temp(v):
+    """H2D packs current and target into one int: target << 16 | current."""
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return None
+    return {"now": v & 0xFFFF, "target": v >> 16}
+
+
+def _num(v, default=None):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def hms_code(e):
+    a, c = int(e.get("attr", 0)), int(e.get("code", 0))
+    return "%04X_%04X_%04X_%04X" % (a >> 16, a & 0xFFFF, c >> 16, c & 0xFFFF)
+
+
+def summarize(raw, cfg):
+    p = raw.get("print", {})
+    dev = p.get("device") or {}
+    state = str(p.get("gcode_state") or "UNKNOWN")
+
+    nozzles = []
+    for e in (dev.get("extruder") or {}).get("info", []) or []:
+        t = _temp(e.get("temp"))
+        if t and (t["now"] or t["target"] or not nozzles):
+            nozzles.append(t)
+    if not nozzles and p.get("nozzle_temper") is not None:
+        nozzles = [{"now": round(_num(p.get("nozzle_temper"), 0)), "target": round(_num(p.get("nozzle_target_temper"), 0))}]
+
+    bed = _temp((dev.get("bed") or {}).get("info", {}).get("temp")) if dev.get("bed") else None
+    if not bed and p.get("bed_temper") is not None:
+        bed = {"now": round(_num(p.get("bed_temper"), 0)), "target": round(_num(p.get("bed_target_temper"), 0))}
+
+    chamber = None
+    ctc = (dev.get("ctc") or {}).get("info", {}).get("temp")
+    if ctc is not None:
+        chamber = (_temp(ctc) or {}).get("now")
+    elif p.get("chamber_temper") is not None:
+        chamber = round(_num(p.get("chamber_temper"), 0))
+
+    ams = []
+    for unit in (p.get("ams") or {}).get("ams", []) or []:
+        slots = []
+        for t in unit.get("tray", []) or []:
+            if not t.get("tray_type"):
+                slots.append({"slot": int(t.get("id", 0)), "empty": True})
+                continue
+            slots.append({
+                "slot": int(t.get("id", 0)),
+                "type": t.get("tray_type"),
+                "name": t.get("tray_sub_brands") or t.get("tray_type"),
+                "color": "#" + str(t.get("tray_color", "000000FF"))[:6],
+                "remain": t.get("remain") if isinstance(t.get("remain"), int) and t.get("remain") >= 0 else None,
+            })
+        hum = unit.get("humidity_raw")  # percent; plain "humidity" is a 1-5 level
+        ams.append({"unit": int(unit.get("id", 0)), "humidity": int(hum) if str(hum or "").isdigit() else None,
+                    "temp": _num(unit.get("temp")), "slots": slots})
+
+    lights = {l.get("node"): l.get("mode") for l in p.get("lights_report", []) or []}
+    err = int(p.get("print_error") or 0)
+    error = "" if not err else "%04X_%04X" % (err >> 16, err & 0xFFFF)
+
+    model = cfg.get("model")
+    for mod in (raw.get("info") or {}).get("module", []) or []:
+        if mod.get("name") == "ota" and mod.get("product_name"):
+            model = mod["product_name"].replace("Bambu Lab ", "")
+
+    return {
+        "ok": True,
+        "id": cfg.get("id"),
+        "name": cfg.get("name"),
+        "model": model,
+        "state": state,
+        "state_word": STATES.get(state, state.title()),
+        "job": p.get("subtask_name") or None,
+        "progress": int(p.get("mc_percent") or 0),
+        "layer": int(p.get("layer_num") or 0),
+        "layers": int(p.get("total_layer_num") or 0),
+        "remaining_min": int(p.get("mc_remaining_time") or 0),
+        "nozzles": nozzles,
+        "bed": bed,
+        "chamber": chamber,
+        "ams": ams,
+        "light": lights.get("chamber_light"),
+        "speed": SPEED_NAMES.get(int(p.get("spd_lvl") or 0)),
+        "error": error,
+        "notices": [hms_code(e) for e in p.get("hms", []) or []],
+        "wifi": p.get("wifi_signal"),
+        "camera": "rtsp" if (p.get("ipcam") or {}).get("rtsp_url") not in (None, "", "disable") else cfg.get("camera", "jpeg"),
+        "controls": cfg.get("controls"),
+        "updated": int(time.time()),
+    }
+
+
+def label(p):
+    """'Garage (A1)', or just 'H2D' when the name is the model."""
+    name, model = str(p.get("name") or "Printer"), p.get("model")
+    return f"{name} ({model})" if model and model != name else name
+
+
+def minutes(m):
+    m = max(0, int(m))
+    return f"{m} min" if m < 60 else f"{m // 60} h {m % 60} min"
+
+
+def print_human(s):
+    head = f"{s['name']}" + (f" ({s['model']})" if s["model"] and s["model"] != s["name"] else "") + f": {s['state_word']}"
+    print(head)
+    if s["job"]:
+        print(f"  Job       {s['job']}")
+    if s["state"] in ("RUNNING", "PAUSE", "PREPARE"):
+        print(f"  Progress  {s['progress']}%, layer {s['layer']} of {s['layers']}, {minutes(s['remaining_min'])} left")
+    temps = []
+    for i, n in enumerate(s["nozzles"]):
+        label = "Nozzle" if len(s["nozzles"]) == 1 else ("Left" if i == 0 else "Right")
+        temps.append(f"{label} {n['now']}°" + (f"/{n['target']}°" if n["target"] else ""))
+    if s["bed"]:
+        temps.append(f"Bed {s['bed']['now']}°" + (f"/{s['bed']['target']}°" if s["bed"]["target"] else ""))
+    if s["chamber"] is not None:
+        temps.append(f"Chamber {s['chamber']}°")
+    if temps:
+        print("  Temps     " + "   ".join(temps))
+    for unit in s["ams"]:
+        parts = []
+        for sl in unit["slots"]:
+            if sl.get("empty"):
+                parts.append(f"{sl['slot'] + 1}: empty")
+            else:
+                rem = f" {sl['remain']}%" if sl["remain"] is not None else ""
+                parts.append(f"{sl['slot'] + 1}: {sl['name']}{rem}")
+        hum = f"   ({unit['humidity']}% humidity)" if unit["humidity"] is not None else ""
+        print(f"  AMS {unit['unit'] + 1}     " + "   ".join(parts) + hum)
+    extra = []
+    if s["speed"]:
+        extra.append(f"speed {s['speed']}")
+    if s["light"]:
+        extra.append(f"light {s['light']}")
+    if s["wifi"]:
+        extra.append(f"wifi {s['wifi']}")
+    if extra:
+        print("  " + ", ".join(extra))
+    if s["error"]:
+        print(f"  ERROR     {s['error']}")
+
+
+# ---------------------------------------------------------------- commands to the printer
+
+def send_command(cfg, msg, kind, wait=8.0):
+    """Send one command and wait for the printer's answer.
+    Returns True (done), False (refused), None (no answer)."""
+    m = Mqtt(cfg)
+    try:
+        seq = m.publish(msg)
+        cmd = list(msg.values())[0].get("command")
+        for reply in m.messages(wait):
+            sec = reply.get(kind) or {}
+            if sec.get("command") != cmd:
+                continue
+            if sec.get("sequence_id") not in (seq, None) and kind == "print":
+                continue
+            result = str(sec.get("result", "")).lower()
+            reason = str(sec.get("reason", "") or sec.get("err_code", ""))
+            if result == "success":
+                return True, ""
+            if result or reason:
+                return False, reason or result
+        return None, ""
+    finally:
+        m.close()
+
+
+def refused_text(reason):
+    if "verify" in reason.lower():
+        return ("The printer refused: Developer Mode is off. Controls need it on.\n"
+                "  On the printer: Settings > Network > LAN Only Mode on, then Developer Mode on.\n"
+                "  Status, camera and notifications work without it.")
+    return f"The printer refused the command ({reason})."
+
+
+def require_controls(cfg):
+    if cfg.get("controls") is False:
+        raise Fail(refused_text("verify") + "\n  Changed it? Run: bambu doctor")
+
+
+def do_print_cmd(cfg, command, param=""):
+    require_controls(cfg)
+    ok, reason = send_command(cfg, {"print": {"command": command, "param": param}}, "print")
+    if ok is False:
+        if "verify" in reason.lower():
+            cfg["controls"] = False
+            save_config(cfg)
+        raise Fail(refused_text(reason))
+    return ok
+
+
+def check_controls(cfg, raw=None):
+    """Harmless test: set the chamber light to the mode it already has."""
+    raw = raw or fetch_raw(cfg)
+    lights = {l.get("node"): l.get("mode") for l in raw.get("print", {}).get("lights_report", []) or []}
+    mode = lights.get("chamber_light", "on")
+    if mode not in ("on", "off"):
+        mode = "on"
+    ok, reason = send_command(cfg, light_msg("chamber_light", mode), "system")
+    return ok, reason
+
+
+def light_msg(node, mode):
+    return {"system": {"command": "ledctrl", "led_node": node, "led_mode": mode,
+                       "led_on_time": 500, "led_off_time": 500, "loop_times": 0, "interval_time": 0}}
+
+
+# ---------------------------------------------------------------- camera
+
+def snapshot(cfg, out, kind=None):
+    kind = kind or cfg.get("camera") or "rtsp"
+    tmp = out + ".part"
+    try:
+        if kind == "rtsp":
+            if not shutil.which("ffmpeg"):
+                raise Fail("ffmpeg is needed for the camera on this printer.")
+            url = f"rtsps://bblp:{cfg['code']}@{cfg['ip']}:322/streaming/live/1"
+            # ffmpeg 8+ verifies TLS and rejects the printer's self-signed certificate;
+            # older ffmpeg does not know -tls_verify at all. Try the new way, fall back.
+            for extra in (["-tls_verify", "0"], []):
+                r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-rtsp_transport", "tcp"]
+                                   + extra + ["-i", url, "-frames:v", "1", "-q:v", "3", "-f", "image2", tmp],
+                                   capture_output=True, timeout=40)
+                if b"tls_verify not found" not in r.stderr:
+                    break
+            if r.returncode != 0 or not os.path.exists(tmp) or not os.path.getsize(tmp):
+                raise Fail("No camera picture. On the printer, turn on LAN Only Liveview.")
+        else:
+            with open(tmp, "wb") as f:
+                f.write(jpeg_frame(cfg))
+        os.replace(tmp, out)
+        return out
+    except subprocess.TimeoutExpired:
+        raise Fail("The camera did not answer in 40 s. On the printer, check LAN Only Liveview.")
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def jpeg_frame(cfg):
+    """A1 / P1 camera: TLS on 6000, an 80 byte login, then length-prefixed JPEGs."""
+    s = tls_socket(cfg["ip"], 6000, timeout=10)
+    try:
+        auth = struct.pack("<IIII", 0x40, 0x3000, 0, 0)
+        auth += b"bblp".ljust(32, b"\0") + cfg["code"].encode().ljust(32, b"\0")
+        s.sendall(auth)
+        buf = b""
+
+        def read(n):
+            nonlocal buf
+            while len(buf) < n:
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise Fail("The camera closed the connection.")
+                buf += chunk
+            out, buf = buf[:n], buf[n:]
+            return out
+        size = struct.unpack("<I", read(16)[:4])[0]
+        img = read(size)
+        if not img.startswith(b"\xff\xd8"):
+            raise Fail("The camera sent something that is not a picture.")
+        return img
+    finally:
+        s.close()
+
+
+# ---------------------------------------------------------------- setup wizard
+
+def have_gum():
+    return sys.stdin.isatty() and shutil.which("gum") is not None
+
+
+def say(text=""):
+    print(text)
+
+
+def title(text):
+    if have_gum():
+        subprocess.run(["gum", "style", "--bold", "--margin", "1 0 0 0", text])
+    else:
+        print("\n" + text + "\n" + "-" * len(text))
+
+
+def ask(prompt, password=False, placeholder=""):
+    if have_gum():
+        cmd = ["gum", "input", "--prompt", prompt + " ", "--placeholder", placeholder]
+        if password:
+            cmd.append("--password")
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        if r.returncode == 130:
+            raise KeyboardInterrupt
+        return r.stdout.strip()
+    if password:
+        import getpass
+        return getpass.getpass(prompt + " ").strip()
+    return input(prompt + " ").strip()
+
+
+def confirm(prompt, default=True):
+    if have_gum():
+        r = subprocess.run(["gum", "confirm", prompt] + ([] if default else ["--default=false"]))
+        if r.returncode == 130:
+            raise KeyboardInterrupt
+        return r.returncode == 0
+    a = input(prompt + (" [Y/n] " if default else " [y/N] ")).strip().lower()
+    return default if not a else a.startswith("y")
+
+
+def choose(prompt, options):
+    if have_gum():
+        r = subprocess.run(["gum", "choose", "--header", prompt] + options, stdout=subprocess.PIPE, text=True)
+        if r.returncode == 130:
+            raise KeyboardInterrupt
+        return r.stdout.strip()
+    print(prompt)
+    for i, o in enumerate(options, 1):
+        print(f"  {i}. {o}")
+    while True:
+        a = input("Number: ").strip()
+        if a.isdigit() and 1 <= int(a) <= len(options):
+            return options[int(a) - 1]
+
+
+def spin(text, fn, *args):
+    if sys.stdout.isatty():
+        print(text + " ", end="", flush=True)
+    try:
+        return fn(*args)
+    finally:
+        if sys.stdout.isatty():
+            print("done")
+
+
+def code_hint(model):
+    m = (model or "").upper()
+    if m.startswith("A1") or m.startswith("P1") or m.startswith("P2"):
+        return "On the printer screen: Settings (the gear) > WLAN. The access code is listed there."
+    return "On the printer screen: Settings > Network. The access code is under LAN Only Mode."
+
+
+def cmd_setup(args):
+    title("Bambu printer setup")
+    say("This connects the bar widget and the `bambu` command to your printer,")
+    say("straight over your own network. Nothing goes through the Bambu cloud.")
+    say("You need: the printer switched on, on the same Wi-Fi or network as this laptop.")
+
+    existing = load_all()
+    replacing = None
+    if existing:
+        say("")
+        say("Set up already: " + ", ".join(f"{p['name']} ({p['id']})" for p in existing))
+        add = "Add another printer"
+        options = [add] + [f"Set up {p['name']} again" for p in existing] + ["Cancel"]
+        what = choose("What do you want to do?", options)
+        if what == "Cancel":
+            return 0
+        if what != add:
+            replacing = existing[options.index(what) - 1]
+
+    # 1. find it
+    title("1. Finding your printer")
+    found = spin("Looking for printers on your network (about 6 s)...", discover, 6.0)
+    known = {p["serial"] for p in existing if p is not replacing}
+    if any(p["serial"] in known for p in found):
+        say("Already set up, skipped: " + ", ".join(p["ip"] for p in found if p["serial"] in known))
+    found = [p for p in found if p["serial"] not in known]
+    printer = None
+    if found:
+        labels = [(f"{p['name']} ({p['model']}) at {p['ip']}" if p["model"] else f"{p['name']} at {p['ip']}")
+                  for p in found]
+        manual = "None of these, type the address myself"
+        pick = labels[0] if len(found) == 1 and confirm(f"Found {labels[0]}. Use it?") else None
+        if pick is None:
+            pick = choose("Which printer?", labels + [manual])
+        if pick != manual:
+            printer = found[labels.index(pick)]
+    else:
+        say("No printer found. That usually means one of these:")
+        say("  - it is off, or still booting (give it a minute and run setup again)")
+        say("  - the laptop is on a different network (guest Wi-Fi, or a VPN is on)")
+        say("  - your network is bigger than the 254 addresses the scan covers")
+        say("You can type the address instead. It is on the printer screen under network settings.")
+    if printer is None:
+        ip = ask("Printer IP address:", placeholder="192.168.1.50")
+        if not ip:
+            raise Fail("Need the printer's address.")
+        printer = probe(ip, timeout=3)  # the certificate tells us the serial number
+        if printer is None:
+            raise Fail(f"Nothing at {ip} answers like a Bambu printer (port 8883). Check the address.")
+        if printer["serial"] in known:
+            raise Fail(f"The printer at {ip} is already set up. To redo it, run setup and pick it.")
+
+    # 2. access code
+    title("2. The access code")
+    say("The printer has an 8 character access code. It works as the password for your network.")
+    say(code_hint(printer.get("model")))
+    cfg = {"name": printer["name"], "ip": printer["ip"], "serial": printer["serial"],
+           "model": printer.get("model") or "", "model_code": printer.get("model_code") or ""}
+    raw = None
+    for attempt in range(3):
+        cfg["code"] = ask("Access code:", password=True)
+        try:
+            raw = spin("Connecting...", fetch_raw, cfg)
+            break
+        except Fail as e:
+            if "access code" not in str(e) or attempt == 2:
+                raise
+            say(str(e) + " Try again.")
+    if not raw or "print" not in raw:
+        raise Fail("Connected, but the printer sent no status. Try again in a minute.")
+    s = summarize(raw, cfg)
+    cfg["model"] = s["model"] or cfg["model"]
+    if cfg["name"] == "Bambu printer":
+        cfg["name"] = name_from(raw, cfg)
+    say(f"Connected to {cfg['name']} ({cfg['model']}). It is {s['state_word'].lower()}.")
+    others = [p for p in existing if p is not replacing and p["serial"] != cfg["serial"]]
+    default = replacing["name"] if replacing else cfg["name"]
+    name = ask(f"What do you call this printer? (Enter keeps '{default}')", placeholder=default)
+    cfg["name"] = name or default
+    cfg["id"] = slug(cfg["name"], {p["id"] for p in others})
+    if others:
+        say(f"In the terminal it is: bambu status {cfg['id']}")
+
+    # 3. controls
+    title("3. Controls (pause, stop, light, speed)")
+    ok, reason = spin("Testing with a harmless command (the light stays as it is)...", check_controls, cfg, raw)
+    cfg["controls"] = ok
+    if ok:
+        say("Controls work. Developer Mode is on.")
+    elif ok is False:
+        say("The printer said no: Developer Mode is off. That is the default, and it is fine.")
+        say("Status, camera and notifications all work without it.")
+        say("For pause/stop/light/speed you need, on the printer: LAN Only Mode on, then Developer Mode on.")
+        say("Know the cost first: in LAN Only Mode the Bambu Handy app and cloud printing stop working.")
+        say("Turned it on later? Run: bambu doctor")
+    else:
+        say("No answer to the test, so controls are unknown. Run `bambu doctor` later.")
+
+    # 4. camera
+    title("4. Camera")
+    cfg["camera"] = s["camera"]
+    path = os.path.join(RUNTIME, "bambu-setup-snap.jpg")
+    try:
+        spin("Grabbing one picture...", snapshot, cfg, path)
+        say(f"Camera works ({path}).")
+        cfg["camera_ok"] = True
+    except Fail as e:
+        cfg["camera_ok"] = False
+        say(str(e))
+        if cfg["camera"] == "jpeg":
+            say("(The A1/P1 camera path is untested so far. A report helps: bambu doctor)")
+
+    if replacing and replacing["serial"] != cfg["serial"]:
+        save_all([p for p in load_all() if p["serial"] != replacing["serial"]])
+    save_config(cfg)
+    say(f"\nSaved to {CONFIG} (only your user can read it).")
+
+    # 5. command + bar
+    title("5. Finishing")
+    here = os.path.realpath(__file__)
+    link = os.path.expanduser("~/.local/bin/bambu")
+    if os.path.realpath(link) != here and confirm("Make `bambu` a command you can type anywhere?"):
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(here, link)
+        say(f"Linked {link}")
+    say("\nAll set. Try: bambu status")
+    say("The bar icon picks this up on its own within a few seconds.")
+    say("Another printer? Run setup again and pick 'Add another printer'.")
+    return 0
+
+
+# ---------------------------------------------------------------- the rest of the commands
+
+def targets():
+    """The printers a command covers: the one named, or all of them."""
+    printers = load_all()
+    if not printers:
+        raise Fail("No printer set up yet. Run: bambu setup")
+    return [pick(printers, WANT)] if WANT else printers
+
+
+def cmd_status(args):
+    out = []
+    for cfg in targets():
+        try:
+            s = summarize(fetch_raw(cfg), cfg)
+        except Fail as e:
+            s = {"ok": False, "id": cfg["id"], "name": cfg["name"], "error": str(e)}
+        out.append(s)
+    if "--json" in args:
+        # Always the same shape, so scripts do not break when a second printer is added.
+        print(json.dumps({"ok": all(s["ok"] for s in out), "printers": out}))
+    else:
+        for i, s in enumerate(out):
+            if i:
+                print()
+            if s["ok"]:
+                print_human(s)
+            else:
+                print(f"{s['name']}: {s['error']}")
+    return 0 if all(s["ok"] for s in out) else 1
+
+
+def watch_one(cfg, as_json, multi, lock):
+    tag = f"{cfg['name']}: " if multi else ""
+
+    def emit(obj, line):
+        with lock:
+            print(json.dumps(obj) if as_json else f"{time.strftime('%H:%M:%S')}  {tag}{line}", flush=True)
+
+    last, last_full, last_full_text = None, 0.0, ""
+    last_scan, m = 0.0, None
+    while True:
+        try:
+            m = Mqtt(cfg)
+            m.publish({"pushing": {"command": "pushall", "version": 1, "push_target": 1}})
+            m.publish({"info": {"command": "get_version"}})
+            raw = {}
+            for msg in m.messages(None):
+                merge(raw, msg)
+                if "gcode_state" not in raw.get("print", {}):
+                    continue
+                s = summarize(raw, cfg)
+                if as_json:
+                    # Big changes go out at once; temperature drift at most every 5 s.
+                    key = json.dumps([s[k] for k in ("state", "job", "progress", "layer", "error", "light", "speed")])
+                    full = json.dumps({k: v for k, v in s.items() if k != "updated"}, sort_keys=True)
+                    now = time.time()
+                    if key == last and (full == last_full_text or now - last_full < 5):
+                        continue
+                    last, last_full, last_full_text = key, now, full
+                    emit(s, "")
+                else:
+                    line = f"{s['state_word']}"
+                    if s["state"] in ("RUNNING", "PAUSE"):
+                        line += f"  {s['progress']}%  layer {s['layer']}/{s['layers']}  {minutes(s['remaining_min'])} left"
+                    if s["error"]:
+                        line += f"  ERROR {s['error']}"
+                    if line == last:
+                        continue
+                    last = line
+                    emit(None, line)
+        except Exception as e:  # anything at all: report it, reconnect, never let the thread die
+            if m is not None:
+                m.close()
+                m = None
+            last = None
+            text = str(e) if isinstance(e, Fail) else (
+                f"connection lost ({e})" if isinstance(e, (OSError, ssl.SSLError))
+                else f"unexpected answer from the printer ({e.__class__.__name__}: {e})")
+            emit({"ok": False, "id": cfg["id"], "name": cfg["name"], "error": text, "updated": int(time.time())},
+                 f"{text} Retrying in 15 s.")
+            # Routers hand out new addresses: look for the same serial, at most every 5 minutes,
+            # so a printer that is simply switched off does not set off a scan every 15 s all night.
+            if "Could not reach" in text and time.time() - last_scan > 300:
+                last_scan = time.time()
+                moved = [p for p in discover(4.0, passes=1) if p["serial"] == cfg["serial"]]
+                if moved and moved[0]["ip"] != cfg["ip"]:
+                    cfg["ip"] = moved[0]["ip"]
+                    with lock:  # patch only the address, on the current file, not our old copy
+                        fresh = [p for p in load_all() if p["serial"] == cfg["serial"]]
+                        if fresh:
+                            fresh[0]["ip"] = cfg["ip"]
+                            save_config(fresh[0])
+                            global OWN_WRITE
+                            OWN_WRITE = os.path.getmtime(CONFIG)
+                    continue
+            time.sleep(15)
+
+
+def cmd_watch(args):
+    """One connection per printer, kept open. A line (or a JSON object) whenever one changes."""
+    import threading
+    printers = targets()
+    as_json = "--json" in args
+    lock = threading.Lock()
+    for cfg in printers:
+        threading.Thread(target=watch_one, args=(cfg, as_json, len(printers) > 1, lock), daemon=True).start()
+    # Setup added or changed a printer: exit, and the bar widget starts a fresh watch.
+    stamp = os.path.getmtime(CONFIG)
+    while True:
+        time.sleep(5)
+        try:
+            now = os.path.getmtime(CONFIG)
+            if now == OWN_WRITE:  # our own address update; nothing for the widget to redo
+                stamp = now
+            if now != stamp:
+                return 0
+        except FileNotFoundError:
+            return 0
+
+
+def cmd_simple(command):
+    def run(args):
+        cfg = load_config()
+        if command == "stop" and "--yes" not in args:
+            if not sys.stdin.isatty():
+                raise Fail("Refusing to stop without --yes (this cancels the print).")
+            if not confirm(f"Stop the print on {cfg['name']}? It cannot be resumed.", default=False):
+                return 1
+        ok = do_print_cmd(cfg, command)
+        print({"pause": "Paused.", "resume": "Resumed.", "stop": "Stopped."}[command] if ok
+              else "Sent. The printer did not confirm; check with: bambu status")
+        return 0
+    return run
+
+
+def cmd_light(args):
+    if not args or args[0] not in ("on", "off"):
+        raise Fail("Usage: bambu light on|off [printer]")
+    cfg = load_config()
+    require_controls(cfg)
+    raw = fetch_raw(cfg, 5)
+    nodes = [l.get("node") for l in raw.get("print", {}).get("lights_report", []) or []
+             if str(l.get("node", "")).startswith("chamber_light")] or ["chamber_light"]
+    for node in nodes:
+        ok, reason = send_command(cfg, light_msg(node, args[0]), "system")
+        if ok is False:
+            raise Fail(refused_text(reason))
+    print(f"Light {args[0]}.")
+    return 0
+
+
+def cmd_speed(args):
+    if not args or args[0] not in SPEEDS:
+        raise Fail("Usage: bambu speed " + "|".join(SPEEDS) + " [printer]")
+    cfg = load_config()
+    ok = do_print_cmd(cfg, "print_speed", str(SPEEDS[args[0]]))
+    print(f"Speed {args[0]}." if ok else "Sent. The printer did not confirm.")
+    return 0
+
+
+def cmd_snapshot(args):
+    cfg = load_config()
+    out = args[0] if args else os.path.join(RUNTIME, f"bambu-snapshot-{cfg['id']}.jpg")
+    print(snapshot(cfg, out))
+    return 0
+
+
+def doctor_one(cfg, found):
+    print(f"\nPrinter   {label(cfg)} at {cfg['ip']}, called '{cfg['id']}'")
+    me = [p for p in found if p["serial"] == cfg["serial"]]
+    if me:
+        print(f"Network   found at {me[0]['ip']}" + (", LAN Only Mode on" if me[0]["mode"] == "lan" else ""))
+        if me[0]["ip"] != cfg["ip"]:
+            cfg["ip"] = me[0]["ip"]
+            save_config(cfg)
+            print(f"          the address changed; updated to {cfg['ip']}")
+    else:
+        print("Network   not found by the scan (fine if it still connects below)")
+    try:
+        raw = fetch_raw(cfg)
+        s = summarize(raw, cfg)
+        fw = next((m.get("sw_ver") for m in (raw.get("info") or {}).get("module", []) or []
+                   if m.get("name") == "ota"), None)
+        print(f"Status    ok, {s['state_word'].lower()}" + (f", firmware {fw}" if fw else ""))
+    except Fail as e:
+        print(f"Status    FAILED: {e}")
+        return False
+    ok, reason = check_controls(cfg, raw)
+    print("Controls  " + ("ok, Developer Mode on" if ok else
+                          "off: Developer Mode is off (status still works)" if ok is False else "no answer"))
+    if ok is not None:
+        cfg["controls"] = ok
+    cfg["camera"] = s["camera"]
+    try:
+        snapshot(cfg, os.path.join(RUNTIME, f"bambu-doctor-{cfg['id']}.jpg"))
+        print(f"Camera    ok ({cfg['camera']})")
+        cfg["camera_ok"] = True
+    except Fail as e:
+        print(f"Camera    FAILED ({cfg['camera']}): {e}")
+        cfg["camera_ok"] = False
+    save_config(cfg)
+    return True
+
+
+def cmd_doctor(args):
+    printers = targets()
+    print(f"bambu {VERSION}, config {CONFIG}")
+    found = discover(6.0)
+    results = [doctor_one(cfg, found) for cfg in printers]
+    return 0 if all(results) else 1
+
+
+def cmd_list(args):
+    printers = load_all()
+    if not printers:
+        print("No printers set up. Run: bambu setup")
+        return 0
+    for p in printers:
+        print(f"{p['id']:<16}{label(p)} at {p['ip']}"
+              + ("" if p.get("controls") else ", read-only"))
+    return 0
+
+
+def cmd_rename(args):
+    if WANT is None or not args:
+        raise Fail("Usage: bambu rename <printer> <new name>")
+    printers = load_all()
+    cfg = pick(printers, WANT)
+    cfg["name"] = " ".join(args)
+    cfg["id"] = slug(cfg["name"], {p["id"] for p in printers if p["serial"] != cfg["serial"]})
+    save_config(cfg)
+    print(f"Renamed to {cfg['name']}. In the terminal it is: {cfg['id']}")
+    return 0
+
+
+def cmd_forget(args):
+    printers = load_all()
+    if not printers:
+        print("No printer was saved.")
+        return 0
+    cfg = pick(printers, WANT)
+    if "--yes" not in args and sys.stdin.isatty() and not confirm(f"Forget {cfg['name']}?", default=False):
+        return 1
+    save_all([p for p in printers if p["serial"] != cfg["serial"]])
+    print(f"Forgot {cfg['name']}.")
+    return 0
+
+
+def cmd_config(args):
+    """For the widget: which printers are set up and what they may do. Never prints a code."""
+    printers = load_all()
+    print(json.dumps({"configured": bool(printers),
+                      "printers": [{k: p.get(k) for k in ("id", "name", "model", "controls", "camera_ok")}
+                                   for p in printers]}))
+    return 0
+
+
+COMMANDS = {
+    "setup": cmd_setup, "status": cmd_status, "watch": cmd_watch, "list": cmd_list,
+    "pause": cmd_simple("pause"), "resume": cmd_simple("resume"), "stop": cmd_simple("stop"),
+    "light": cmd_light, "speed": cmd_speed, "snapshot": cmd_snapshot,
+    "doctor": cmd_doctor, "rename": cmd_rename, "forget": cmd_forget, "config": cmd_config,
+}
+
+
+def main(argv):
+    global WANT
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # keep prompts and output in order when piped
+    except AttributeError:
+        pass
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] in ("-v", "--version"):
+        print(VERSION)
+        return 0
+    fn = COMMANDS.get(argv[0])
+    if not fn:
+        print(f"Unknown command: {argv[0]}. Try: bambu help", file=sys.stderr)
+        return 2
+    args = list(argv[1:])
+    try:
+        # Which printer: -p NAME / --printer NAME, or the first word that names one.
+        for flag in ("-p", "--printer"):
+            if flag in args:
+                i = args.index(flag)
+                if i + 1 >= len(args):
+                    raise Fail(f"{flag} needs a printer name")
+                WANT = args[i + 1]
+                del args[i:i + 2]
+        if WANT is None and argv[0] not in ("setup", "config", "list"):
+            for i, a in enumerate(args):
+                if is_printer(a):
+                    WANT = args.pop(i)
+                    break
+        return fn(args) or 0
+    except Fail as e:
+        if "--json" in argv:
+            print(json.dumps({"ok": False, "error": str(e)}))
+        else:
+            print(str(e), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print()
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

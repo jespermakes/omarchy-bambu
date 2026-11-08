@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "jespermakes.bambu-printer",
+  "name": "Bambu printer",
+  "version": "0.2.0",
+  "author": "Jesper Makes",
+  "license": "MIT",
+  "description": "Your Bambu Lab 3D printer in the bar, straight over your own network: progress, temperatures, AMS spools, the chamber camera, notifications, and pause, stop, light and speed. Comes with a `bambu` command for the terminal. No cloud, no account.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Bambu printer",
+    "description": "Yellow while printing, green when done, red when it needs you. Click for the camera, spools and controls.",
+    "category": "Status",
+    "aliases": ["printer", "bambu", "3d", "h2d", "x1", "p1", "a1"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "cameraIntervalSec": 15, "showCamera": true, "hideWhenIdle": false },
+    "schema": [
+      { "key": "showCamera", "type": "boolean", "label": "Show the camera in the panel", "defaultValue": true },
+      { "key": "cameraIntervalSec", "type": "integer", "label": "Camera refresh while the panel is open (seconds)", "min": 5, "max": 120, "step": 5, "defaultValue": 15 },
+      { "key": "hideWhenIdle", "type": "boolean", "label": "Dim the icon when the printer is idle", "defaultValue": false }
+    ]
+  }
+}
