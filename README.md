@@ -15,6 +15,16 @@ omarchy plugin add https://github.com/jespermakes/omarchy-bambu.git --enable
 
 Then click the printer icon in the bar and press **Set up printer**.
 
+It needs `python3` and `ffmpeg` (for the H2D and X1 camera), which a standard Omarchy install
+already has, and uses `gum` for a nicer setup when it is there. To remove it again:
+
+```
+omarchy plugin remove jespermakes.bambu-printer
+rm -rf ~/.config/bambu-printer ~/.local/bin/bambu
+```
+
+The second line deletes your saved printers and access codes, and the `bambu` command.
+
 ## What you get
 
 - **The bar icon** turns yellow while printing, green when a print is done and waiting on the
