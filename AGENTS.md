@@ -89,7 +89,14 @@ If you change the JSON shape from `summarize()`, update `Panel.qml` in the same 
    gets the camera address through a mode 600 concat file (`snapshot()`); ffmpeg has no other
    way to take RTSP credentials (`-/i` does not exist in 6 or 9). Never print ffmpeg's stderr:
    it echoes that address.
-8. **Port 2021 may be taken** by Bambu Studio on the same laptop; the listener then gives up
+8. **ffmpeg must never open its own connection to the printer.** Checking the certificate on
+   one connection and letting ffmpeg open another proves nothing (the catalog review caught
+   exactly that). `CameraRelay` listens on 127.0.0.1, opens the pinned TLS connection per
+   client, and rewrites the request lines to the printer's own `rtsps://<ip>:322` (it answers
+   anything else with a 301) and its addresses back. The Digest `uri=` stays untouched,
+   because the printer checks the hash against it. ffmpeg runs with
+   `-protocol_whitelist file,rtsp,tcp`, so a missed rewrite fails closed instead of leaking.
+9. **Port 2021 may be taken** by Bambu Studio on the same laptop; the listener then gives up
    quietly and the scan carries discovery.
 
 ## Testing a change

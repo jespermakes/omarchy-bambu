@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "jespermakes.bambu-printer",
   "name": "Bambu printer",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": "Jesper Makes",
   "license": "MIT",
   "description": "Your Bambu Lab 3D printer in the bar, straight over your own network: progress, temperatures, AMS spools, the chamber camera, notifications, and pause, stop, light and speed. Comes with a `bambu` command for the terminal. No cloud, no account.",

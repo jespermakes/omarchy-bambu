@@ -149,13 +149,15 @@ back as a pull request, so the next person with your printer gets it too.
   password. One connection per printer stays open while the bar runs (`bambu watch --json`), so
   the bar changes as soon as the printer reports a new state.
 - **Camera:** RTSPS on port 322 for the H2D and X1 (needs *LAN Only Liveview* on the printer, and
-  `ffmpeg`, which Omarchy ships), a JPEG stream on port 6000 for the P1 and A1.
+  `ffmpeg`, which Omarchy ships, through the pinned relay), a JPEG stream on port 6000 for the P1 and A1.
 - **Discovery:** a scan of your local /24 for port 8883, reading each printer's certificate, plus
   the printer's SSDP announcements on UDP 2021 when the firewall lets them through.
 - **Privacy:** everything stays on your network. The printer's certificate is self-signed, so it
   cannot be checked against an authority. Instead setup saves its fingerprint, and every later
   connection (status, controls, both camera ports) must show the same certificate before the
-  access code is sent. A device that copies the printer's serial number cannot collect the
+  access code is sent. ffmpeg never connects to the printer itself: it talks to a relay on
+  your laptop's loopback, which carries its traffic over a connection the plugin opened and
+  checked. A device that copies the printer's serial number cannot collect the
   code, and when the printer gets a new address, the plugin only follows it to a device with
   that same certificate. Printers set up with 0.2 or earlier get their fingerprint saved on the
   first connection after the update, at the address they already had.

@@ -38,7 +38,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "bambu-printer")
 CONFIG = os.path.join(CONFIG_DIR, "printers.json")
 OLD_CONFIG = os.path.join(CONFIG_DIR, "printer.json")  # v0.1, one printer; migrated on first read
@@ -709,35 +709,110 @@ def light_msg(node, mode):
 
 # ---------------------------------------------------------------- camera
 
+class CameraRelay:
+    """127.0.0.1:<port> to the printer's RTSPS port 322, through tls_socket() and its pin.
+
+    The printer answers only requests addressed to itself (anything else gets a 301 to its
+    own rtsps:// address), so the request lines are rewritten on the way in and the
+    addresses in its answers on the way out. The Digest login is left alone: its uri= is the
+    one ffmpeg hashed, and the printer checks the hash against that. If a rewrite is ever
+    missed, ffmpeg tries rtsps:// itself and the protocol whitelist stops it: it fails closed."""
+
+    def __init__(self, cfg):
+        self.cfg, self.error, self.done = cfg, None, False
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(4)
+        self.srv.settimeout(1.0)
+        self.port = self.srv.getsockname()[1]
+        import re
+        here = b"rtsp://127.0.0.1:%d" % self.port
+        there = b"rtsps://%s:322" % cfg["ip"].encode()
+        self.inward = lambda d: re.sub(rb'(?<!uri=")' + re.escape(here), there, d)
+        self.outward = lambda d: re.sub(re.escape(b"rtsps://" + cfg["ip"].encode()) + rb"(:322)?", here, d)
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while not self.done:
+            try:
+                local, _ = self.srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            try:
+                remote = tls_socket(self.cfg["ip"], 322, timeout=10, pin=self.cfg.get("cert"))
+            except Fail as e:  # CertChanged: nothing was forwarded, the code never left
+                self.error = e
+                local.close()
+                continue
+            except (OSError, ssl.SSLError):
+                local.close()
+                continue
+            threading.Thread(target=self._pump, args=(local, remote), daemon=True).start()
+
+    def _pump(self, local, remote):
+        import select
+        local.settimeout(None)
+        remote.settimeout(None)
+        try:
+            while not self.done:
+                # TLS may hold decrypted bytes that select() cannot see: drain those first.
+                ready = [remote] if remote.pending() else select.select([local, remote], [], [], 1.0)[0]
+                for src in ready:
+                    data = src.recv(65536)
+                    if not data:
+                        return
+                    if src is local:
+                        remote.sendall(self.inward(data))
+                    else:
+                        local.sendall(self.outward(data))
+        except (OSError, ssl.SSLError):
+            pass
+        finally:
+            local.close()
+            remote.close()
+
+    def close(self):
+        self.done = True
+        self.srv.close()
+
+
 def snapshot(cfg, out, kind=None):
     kind = kind or cfg.get("camera") or "rtsp"
+    if not cfg.get("cert"):  # a 0.2 config: pin it the same way as status does, then go on
+        Mqtt(cfg).close()
     tmp = out + ".part"
     try:
         if kind == "rtsp":
             if not shutil.which("ffmpeg"):
                 raise Fail("ffmpeg is needed for the camera on this printer.")
-            # The same certificate as port 8883: check it before the code goes anywhere.
-            try:
-                tls_socket(cfg["ip"], 322, timeout=10, pin=cfg.get("cert")).close()
-            except (OSError, ssl.SSLError):
-                raise Fail("No camera picture. On the printer, turn on LAN Only Liveview.")
+            # ffmpeg never talks to the printer itself: it would open its own TLS connection,
+            # one that checks no certificate. It talks plain RTSP to a relay on this laptop's
+            # loopback, and the relay carries those bytes over one TLS connection to the printer,
+            # opened by us and held to the pinned certificate before the first byte goes through.
+            # So whatever receives the access code is the printer that showed the pinned
+            # certificate on that same connection.
+            relay = CameraRelay(cfg)
             # The access code must not be on ffmpeg's command line, where other programs can
             # read it. ffmpeg reads the address from a small concat file instead, private to
-            # this user and deleted at once. `option` lines pass the input options; ffmpeg 6
-            # ignores tls_verify, ffmpeg 8+ needs it for the self-signed certificate.
-            url = f"rtsps://bblp:{cfg['code']}@{cfg['ip']}:322/streaming/live/1"
+            # this user and deleted at once.
+            url = f"rtsp://bblp:{cfg['code']}@127.0.0.1:{relay.port}/streaming/live/1"
             quoted = url.replace("'", "'\\''")  # ffconcat quoting
             fd, spec = tempfile.mkstemp(prefix="bambu-cam-", suffix=".ffconcat", dir=RUNTIME)  # mode 600
             try:
                 with os.fdopen(fd, "w") as f:
-                    f.write(f"ffconcat version 1.0\nfile '{quoted}'\noption rtsp_transport tcp\noption tls_verify 0\n")
+                    f.write(f"ffconcat version 1.0\nfile '{quoted}'\noption rtsp_transport tcp\n")
                 r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
                                     "-f", "concat", "-safe", "0",
-                                    "-protocol_whitelist", "file,rtsp,rtsps,tls,tcp,udp",
+                                    "-protocol_whitelist", "file,rtsp,tcp",
                                     "-i", spec, "-frames:v", "1", "-q:v", "3", "-f", "image2", tmp],
                                    capture_output=True, timeout=40)  # stderr may hold the address: never shown
             finally:
                 os.unlink(spec)
+                relay.close()
+            if relay.error:
+                raise relay.error
             if r.returncode != 0 or not os.path.exists(tmp) or not os.path.getsize(tmp):
                 raise Fail("No camera picture. On the printer, turn on LAN Only Liveview.")
         else:
