@@ -132,6 +132,7 @@ with the output of `bambu doctor`. It never prints your access code.
 | "No camera picture" | *LAN Only Liveview* is off on the printer | Turn it on in the printer's network settings |
 | The camera fails on a P1 or A1 | That camera code is untested | `bambu doctor`, and open an issue |
 | Worked yesterday, offline today | The router gave the printer a new address | It finds the same printer by serial and follows it (`bambu doctor` forces it). A fixed address in the router stops it for good |
+| "shows a different certificate" | The printer's certificate is not the one saved at setup. A firmware update can do that, and so can another device on the network pretending to be the printer, so the access code is not sent | Updated the printer? `bambu setup`, pick it, set it up again. If not, find out what else is on that address |
 | Worked before a firmware update, not after | Bambu changes what other apps may do (they did in 2025) | Open an issue with the `bambu doctor` output |
 
 ## Fixing it yourself, or with an AI agent
@@ -151,10 +152,15 @@ back as a pull request, so the next person with your printer gets it too.
   `ffmpeg`, which Omarchy ships), a JPEG stream on port 6000 for the P1 and A1.
 - **Discovery:** a scan of your local /24 for port 8883, reading each printer's certificate, plus
   the printer's SSDP announcements on UDP 2021 when the firewall lets them through.
-- **Privacy:** everything stays on your network. The printer uses a self-signed certificate, so
-  the connection is encrypted but not verified; every third-party Bambu tool works this way.
-  While a camera picture is being fetched, the access code is in ffmpeg's command line, which
-  other programs running as you can see. Those programs can read the settings file anyway.
+- **Privacy:** everything stays on your network. The printer's certificate is self-signed, so it
+  cannot be checked against an authority. Instead setup saves its fingerprint, and every later
+  connection (status, controls, both camera ports) must show the same certificate before the
+  access code is sent. A device that copies the printer's serial number cannot collect the
+  code, and when the printer gets a new address, the plugin only follows it to a device with
+  that same certificate. Printers set up with 0.2 or earlier get their fingerprint saved on the
+  first connection after the update, at the address they already had.
+- **The access code is never on a command line.** ffmpeg reads the camera address from a small
+  file only you can read, deleted as soon as the picture is taken.
 
 ## Not included, on purpose
 

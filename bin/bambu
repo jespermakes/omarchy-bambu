@@ -25,6 +25,7 @@ Controls (pause, stop, light, speed) need Developer Mode on the printer.
 Everything else works without it.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -34,9 +35,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "bambu-printer")
 CONFIG = os.path.join(CONFIG_DIR, "printers.json")
 OLD_CONFIG = os.path.join(CONFIG_DIR, "printer.json")  # v0.1, one printer; migrated on first read
@@ -65,6 +67,7 @@ class Fail(Exception):
 # ---------------------------------------------------------------- config
 
 OWN_WRITE = None  # mtime of the last config write made by `watch` itself
+CONFIG_LOCK = threading.Lock()
 WANT = None  # the printer named with -p/--printer or as a word on the command line
 
 
@@ -153,6 +156,18 @@ def save_config(cfg):
     save_all(printers)
 
 
+def patch_saved(serial, **fields):
+    """Change a few fields of one saved printer on the current file, not on an old copy.
+    Used from inside `watch`, so the write is marked as our own and does not restart it."""
+    global OWN_WRITE
+    with CONFIG_LOCK:
+        fresh = [p for p in load_all() if p["serial"] == serial]
+        if fresh:
+            fresh[0].update(fields)
+            save_config(fresh[0])
+            OWN_WRITE = os.path.getmtime(CONFIG)
+
+
 # ---------------------------------------------------------------- discovery
 
 def discover(seconds=6.0, passes=2):
@@ -215,7 +230,15 @@ def probe(ip, timeout=2.5):
     names = cert_names(der)
     if b"BBL" not in der or not names:
         return None
-    return {"serial": names[-1], "ip": ip, "name": "Bambu printer", "model_code": "", "model": "", "mode": ""}
+    return {"serial": names[-1], "ip": ip, "name": "Bambu printer", "model_code": "", "model": "", "mode": "",
+            "cert": hashlib.sha256(der).hexdigest()}
+
+
+def same_printer(found, cfg):
+    """A device found on the network is this printer only when it shows the certificate saved
+    at setup. The serial alone is not proof: it is in the certificate, and anyone can make a
+    certificate that says the same serial. So the address is never changed on the serial."""
+    return found["serial"] == cfg["serial"] and bool(cfg.get("cert")) and found.get("cert") == cfg["cert"]
 
 
 def scan_subnet(passes=2):
@@ -302,12 +325,29 @@ def _str(s):
     return struct.pack("!H", len(b)) + b
 
 
-def tls_socket(ip, port, timeout=6.0):
+class CertChanged(Fail):
+    pass
+
+
+def tls_socket(ip, port, timeout=6.0, pin=None):
+    """TLS to the printer. Its certificate is self-signed, so it cannot be verified the usual
+    way; instead setup saves its SHA-256 fingerprint and every later connection must show the
+    same one before anything secret is sent. That is what stops another device on the network
+    from posing as the printer and collecting the access code."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE  # the printer's certificate is self-signed
+    ctx.verify_mode = ssl.CERT_NONE
     raw = socket.create_connection((ip, port), timeout=timeout)
-    return ctx.wrap_socket(raw, server_hostname=ip)
+    s = ctx.wrap_socket(raw, server_hostname=ip)
+    seen = hashlib.sha256(s.getpeercert(binary_form=True) or b"").hexdigest()
+    if pin and seen != pin:
+        s.close()
+        raise CertChanged(f"The printer at {ip} shows a different certificate than the one saved at setup, "
+                          "so the access code was not sent. A firmware update can do this, and so can another "
+                          "device pretending to be the printer. If you updated the printer, run `bambu setup` "
+                          "and set it up again.")
+    s.fingerprint = seen
+    return s
 
 
 class Mqtt:
@@ -317,7 +357,7 @@ class Mqtt:
         self.buf = b""
         self.seq = int(time.time()) % 100000
         try:
-            self.sock = tls_socket(cfg["ip"], 8883, timeout)
+            self.sock = tls_socket(cfg["ip"], 8883, timeout, pin=cfg.get("cert"))
         except (OSError, ssl.SSLError) as e:
             raise Fail(f"Could not reach the printer at {cfg['ip']} ({e.__class__.__name__}: {e}).")
         self.sock.settimeout(timeout)
@@ -335,6 +375,11 @@ class Mqtt:
             raise Fail("The printer refused the access code. Check it on the printer screen.")
         if rc != 0:
             raise Fail(f"The printer refused the connection (code {rc}).")
+        if not cfg.get("cert"):
+            # Saved before 0.3, when no fingerprint was kept: trust the printer at its saved
+            # address this once, and from now on hold it to this certificate.
+            cfg["cert"] = self.sock.fingerprint
+            patch_saved(self.serial, cert=cfg["cert"])
         self._send(0x82, struct.pack("!H", 1) + _str(f"device/{self.serial}/report") + b"\x00")
         self.last_ping = time.time()
 
@@ -671,15 +716,28 @@ def snapshot(cfg, out, kind=None):
         if kind == "rtsp":
             if not shutil.which("ffmpeg"):
                 raise Fail("ffmpeg is needed for the camera on this printer.")
+            # The same certificate as port 8883: check it before the code goes anywhere.
+            try:
+                tls_socket(cfg["ip"], 322, timeout=10, pin=cfg.get("cert")).close()
+            except (OSError, ssl.SSLError):
+                raise Fail("No camera picture. On the printer, turn on LAN Only Liveview.")
+            # The access code must not be on ffmpeg's command line, where other programs can
+            # read it. ffmpeg reads the address from a small concat file instead, private to
+            # this user and deleted at once. `option` lines pass the input options; ffmpeg 6
+            # ignores tls_verify, ffmpeg 8+ needs it for the self-signed certificate.
             url = f"rtsps://bblp:{cfg['code']}@{cfg['ip']}:322/streaming/live/1"
-            # ffmpeg 8+ verifies TLS and rejects the printer's self-signed certificate;
-            # older ffmpeg does not know -tls_verify at all. Try the new way, fall back.
-            for extra in (["-tls_verify", "0"], []):
-                r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-rtsp_transport", "tcp"]
-                                   + extra + ["-i", url, "-frames:v", "1", "-q:v", "3", "-f", "image2", tmp],
-                                   capture_output=True, timeout=40)
-                if b"tls_verify not found" not in r.stderr:
-                    break
+            quoted = url.replace("'", "'\\''")  # ffconcat quoting
+            fd, spec = tempfile.mkstemp(prefix="bambu-cam-", suffix=".ffconcat", dir=RUNTIME)  # mode 600
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(f"ffconcat version 1.0\nfile '{quoted}'\noption rtsp_transport tcp\noption tls_verify 0\n")
+                r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
+                                    "-f", "concat", "-safe", "0",
+                                    "-protocol_whitelist", "file,rtsp,rtsps,tls,tcp,udp",
+                                    "-i", spec, "-frames:v", "1", "-q:v", "3", "-f", "image2", tmp],
+                                   capture_output=True, timeout=40)  # stderr may hold the address: never shown
+            finally:
+                os.unlink(spec)
             if r.returncode != 0 or not os.path.exists(tmp) or not os.path.getsize(tmp):
                 raise Fail("No camera picture. On the printer, turn on LAN Only Liveview.")
         else:
@@ -696,7 +754,7 @@ def snapshot(cfg, out, kind=None):
 
 def jpeg_frame(cfg):
     """A1 / P1 camera: TLS on 6000, an 80 byte login, then length-prefixed JPEGs."""
-    s = tls_socket(cfg["ip"], 6000, timeout=10)
+    s = tls_socket(cfg["ip"], 6000, timeout=10, pin=cfg.get("cert"))
     try:
         auth = struct.pack("<IIII", 0x40, 0x3000, 0, 0)
         auth += b"bblp".ljust(32, b"\0") + cfg["code"].encode().ljust(32, b"\0")
@@ -853,6 +911,11 @@ def cmd_setup(args):
     say(code_hint(printer.get("model")))
     cfg = {"name": printer["name"], "ip": printer["ip"], "serial": printer["serial"],
            "model": printer.get("model") or "", "model_code": printer.get("model_code") or ""}
+    if not printer.get("cert"):  # heard only as an announcement: read the certificate now
+        printer = dict(printer, cert=(probe(printer["ip"], timeout=3) or {}).get("cert"))
+    if not printer.get("cert"):
+        raise Fail(f"Could not read the certificate of the printer at {printer['ip']}. Try again in a minute.")
+    cfg["cert"] = printer["cert"]
     raw = None
     for attempt in range(3):
         cfg["code"] = ask("Access code:", password=True)
@@ -1013,16 +1076,10 @@ def watch_one(cfg, as_json, multi, lock):
             # so a printer that is simply switched off does not set off a scan every 15 s all night.
             if "Could not reach" in text and time.time() - last_scan > 300:
                 last_scan = time.time()
-                moved = [p for p in discover(4.0, passes=1) if p["serial"] == cfg["serial"]]
+                moved = [p for p in discover(4.0, passes=1) if same_printer(p, cfg)]
                 if moved and moved[0]["ip"] != cfg["ip"]:
                     cfg["ip"] = moved[0]["ip"]
-                    with lock:  # patch only the address, on the current file, not our old copy
-                        fresh = [p for p in load_all() if p["serial"] == cfg["serial"]]
-                        if fresh:
-                            fresh[0]["ip"] = cfg["ip"]
-                            save_config(fresh[0])
-                            global OWN_WRITE
-                            OWN_WRITE = os.path.getmtime(CONFIG)
+                    patch_saved(cfg["serial"], ip=cfg["ip"])
                     continue
             time.sleep(15)
 
@@ -1102,9 +1159,16 @@ def doctor_one(cfg, found):
     if me:
         print(f"Network   found at {me[0]['ip']}" + (", LAN Only Mode on" if me[0]["mode"] == "lan" else ""))
         if me[0]["ip"] != cfg["ip"]:
-            cfg["ip"] = me[0]["ip"]
-            save_config(cfg)
-            print(f"          the address changed; updated to {cfg['ip']}")
+            mine = [p for p in me if same_printer(p, cfg)]
+            if mine:
+                cfg["ip"] = mine[0]["ip"]
+                save_config(cfg)
+                print(f"          the address changed; updated to {cfg['ip']}")
+            elif any(p.get("cert") for p in me):
+                print("          a device there claims this serial but shows a different certificate;")
+                print("          not trusted, the address is unchanged. Updated the printer? `bambu setup`")
+            else:
+                print("          only heard its announcement there; the address is unchanged")
     else:
         print("Network   not found by the scan (fine if it still connects below)")
     try:

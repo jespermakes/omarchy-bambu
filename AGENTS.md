@@ -58,6 +58,13 @@ If you change the JSON shape from `summarize()`, update `Panel.qml` in the same 
   fix this project can receive.
 - **Discovery:** printers multicast SSDP on UDP 2021, and the plugin also scans the local
   /24 for port 8883 and reads the printer's TLS certificate, whose CN is the serial number.
+- **Certificate pinning:** the certificate is self-signed, so `tls_socket()` checks its SHA-256
+  against `cert` in the printer's config before anything secret goes out, on 8883, 322 and 6000
+  (the H2D shows the same certificate on all of them). Setup saves it; a config without one is
+  pinned on its first successful login. **Never change a saved address on the serial alone**:
+  `same_printer()` requires the pinned certificate, because a serial is just text anyone can put
+  in a certificate. Do not add a "just reconnect" path around a `CertChanged`; the fix for a real
+  certificate change is `bambu setup`, where the user confirms the printer.
 - Good protocol references: the OpenBambuAPI project and the ha-bambulab Home Assistant
   integration on GitHub.
 
@@ -78,7 +85,11 @@ If you change the JSON shape from `summarize()`, update `Panel.qml` in the same 
 5. **QML only notices a new object.** `printerStates` and `lastPrinterStates` are replaced, never
    mutated in place (`Object.assign({}, ...)`), or the bindings will not update.
 6. **The printer's countdown and "remain" values** are the printer's own; do not "correct" them.
-7. **Port 2021 may be taken** by Bambu Studio on the same laptop; the listener then gives up
+7. **Never put the access code in a command line** (`ps` shows it to every program). ffmpeg
+   gets the camera address through a mode 600 concat file (`snapshot()`); ffmpeg has no other
+   way to take RTSP credentials (`-/i` does not exist in 6 or 9). Never print ffmpeg's stderr:
+   it echoes that address.
+8. **Port 2021 may be taken** by Bambu Studio on the same laptop; the listener then gives up
    quietly and the scan carries discovery.
 
 ## Testing a change
