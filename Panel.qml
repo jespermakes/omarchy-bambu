@@ -22,7 +22,7 @@ Panel {
   manageIpc: true
 
   readonly property string bin: String(Qt.resolvedUrl("bin/bambu")).replace(/^file:\/\//, "")
-  readonly property string snapPath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/bambu-printer-snap-" + (selId || "x") + ".jpg"
+  readonly property string snapPath: (Quickshell.env("XDG_RUNTIME_DIR") || (Quickshell.env("HOME") + "/.cache/bambu-printer")) + "/bambu-printer-snap-" + (selId || "x") + ".jpg"
   readonly property int cameraMs: 1000 * Math.max(5, Number(setting("cameraIntervalSec", 15)))
 
   property var cfg: null          // from `bambu config`: {configured, printers: [{id, name, model, controls}]}

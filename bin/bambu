@@ -38,11 +38,14 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "bambu-printer")
 CONFIG = os.path.join(CONFIG_DIR, "printers.json")
 OLD_CONFIG = os.path.join(CONFIG_DIR, "printer.json")  # v0.1, one printer; migrated on first read
-RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+# Camera pictures and the camera's address file go in a folder only this user can open:
+# $XDG_RUNTIME_DIR (0700 by definition), else ~/.cache/bambu-printer, never a shared /tmp.
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "bambu-printer")
 
 # SSDP model codes we have seen or that the community documents. Unknown codes
 # still work: the model name is also read from the printer itself.
@@ -1224,6 +1227,8 @@ def cmd_speed(args):
 def cmd_snapshot(args):
     cfg = load_config()
     out = args[0] if args else os.path.join(RUNTIME, f"bambu-snapshot-{cfg['id']}.jpg")
+    if os.path.dirname(out):
+        os.makedirs(os.path.dirname(out), mode=0o700, exist_ok=True)
     print(snapshot(cfg, out))
     return 0
 
@@ -1262,7 +1267,7 @@ def doctor_one(cfg, found):
         cfg["controls"] = ok
     cfg["camera"] = s["camera"]
     try:
-        snapshot(cfg, os.path.join(RUNTIME, f"bambu-doctor-{cfg['id']}.jpg"))
+        os.unlink(snapshot(cfg, os.path.join(RUNTIME, f"bambu-doctor-{cfg['id']}.jpg")))  # only a test
         print(f"Camera    ok ({cfg['camera']})")
         cfg["camera_ok"] = True
     except Fail as e:
@@ -1335,6 +1340,9 @@ COMMANDS = {
 
 def main(argv):
     global WANT
+    # Everything this command writes (config, camera pictures) is for this user only.
+    os.umask(0o077)
+    os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
     try:
         sys.stdout.reconfigure(line_buffering=True)  # keep prompts and output in order when piped
     except AttributeError:

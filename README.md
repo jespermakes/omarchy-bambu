@@ -161,6 +161,9 @@ back as a pull request, so the next person with your printer gets it too.
   code, and when the printer gets a new address, the plugin only follows it to a device with
   that same certificate. Printers set up with 0.2 or earlier get their fingerprint saved on the
   first connection after the update, at the address they already had.
+- **Camera pictures are yours only.** They are saved in `$XDG_RUNTIME_DIR`, or in
+  `~/.cache/bambu-printer` when that is not set, never a shared `/tmp`, and every file the
+  plugin writes is readable only by you. `bambu doctor` deletes its test picture.
 - **The access code is never on a command line.** ffmpeg reads the camera address from a small
   file only you can read, deleted as soon as the picture is taken.
 
