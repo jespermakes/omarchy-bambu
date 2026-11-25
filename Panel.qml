@@ -118,7 +118,7 @@ Panel {
     var parts = []
     var nz = st.nozzles || []
     for (var i = 0; i < nz.length; i++) {
-      var label = nz.length === 1 ? "Nozzle" : (i === 0 ? "Left" : "Right")
+      var label = nz[i].name || (nz.length === 1 ? "Nozzle" : "Nozzle " + (i + 1))
       parts.push(label + " " + nz[i].now + "°" + (nz[i].target ? "/" + nz[i].target + "°" : ""))
     }
     if (st.bed) parts.push("Bed " + st.bed.now + "°" + (st.bed.target ? "/" + st.bed.target + "°" : ""))

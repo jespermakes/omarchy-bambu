@@ -524,9 +524,19 @@ def summarize(raw, cfg):
     for e in (dev.get("extruder") or {}).get("info", []) or []:
         t = _temp(e.get("temp"))
         if t and (t["now"] or t["target"] or not nozzles):
+            t["id"] = e.get("id")
             nozzles.append(t)
+    if len(nozzles) > 1:
+        # H2D: extruder id 0 is the RIGHT nozzle (the one the AMS feeds), id 1 the left. Name them by id,
+        # never by place in the list, and show them left to right as they sit on the printer.
+        for n in nozzles:
+            n["name"] = {0: "Right", 1: "Left"}.get(_num(n["id"], -1), f"Nozzle {n['id']}")
+        nozzles.sort(key=lambda n: {"Left": 0, "Right": 1}.get(n["name"], 2))
+    for n in nozzles:
+        n.pop("id", None)
+        n.setdefault("name", "Nozzle")
     if not nozzles and p.get("nozzle_temper") is not None:
-        nozzles = [{"now": round(_num(p.get("nozzle_temper"), 0)), "target": round(_num(p.get("nozzle_target_temper"), 0))}]
+        nozzles = [{"name": "Nozzle", "now": round(_num(p.get("nozzle_temper"), 0)), "target": round(_num(p.get("nozzle_target_temper"), 0))}]
 
     bed = _temp((dev.get("bed") or {}).get("info", {}).get("temp")) if dev.get("bed") else None
     if not bed and p.get("bed_temper") is not None:
@@ -612,9 +622,8 @@ def print_human(s):
     if s["state"] in ("RUNNING", "PAUSE", "PREPARE"):
         print(f"  Progress  {s['progress']}%, layer {s['layer']} of {s['layers']}, {minutes(s['remaining_min'])} left")
     temps = []
-    for i, n in enumerate(s["nozzles"]):
-        label = "Nozzle" if len(s["nozzles"]) == 1 else ("Left" if i == 0 else "Right")
-        temps.append(f"{label} {n['now']}°" + (f"/{n['target']}°" if n["target"] else ""))
+    for n in s["nozzles"]:
+        temps.append(f"{n['name']} {n['now']}°" + (f"/{n['target']}°" if n["target"] else ""))
     if s["bed"]:
         temps.append(f"Bed {s['bed']['now']}°" + (f"/{s['bed']['target']}°" if s["bed"]["target"] else ""))
     if s["chamber"] is not None:

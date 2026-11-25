@@ -98,6 +98,9 @@ If you change the JSON shape from `summarize()`, update `Panel.qml` in the same 
    `-protocol_whitelist file,rtsp,tcp`, so a missed rewrite fails closed instead of leaking.
 9. **Port 2021 may be taken** by Bambu Studio on the same laptop; the listener then gives up
    quietly and the scan carries discovery.
+10. **H2D nozzles: `device.extruder.info[]` id 0 is the RIGHT nozzle** (the one the AMS feeds), id 1
+   the left. Up to 0.3.2 the plugin named them by place in the list and showed them swapped. Each
+   entry in `nozzles` now carries its own `name`; never derive Left/Right from the index.
 
 ## Testing a change
 
